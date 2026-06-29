@@ -7,19 +7,23 @@ manager, nothing to install but the scripts themselves. Keep it that way.
 
 ## Lint & check
 
-The local gate is `shellcheck` plus a parse check on every script. `lane.sh` is
-sourced into a bash-or-zsh profile, so it's checked with `--shell=bash` and the
-dual-shell false positives excluded:
+The local gate is `shellcheck` plus a parse check on every script:
 
 ```sh
-shellcheck -S warning hyperlane install.sh
-shellcheck -S warning --shell=bash -e SC2148,SC2296 lane.sh
+shellcheck -S warning hyperlane lane.sh install.sh
 bash -n hyperlane lane.sh install.sh
 ```
 
-CI runs exactly these on Linux and macOS (it also excludes a few pre-existing
-v0.1.0 engine nits that are tracked for cleanup — see `.github/workflows/ci.yml`;
-don't add new findings). Please run the gate locally before opening a PR — the
+`lane.sh` is sourced into a bash-or-zsh profile, so it carries a
+`# shellcheck shell=bash` directive and line-local disables for its intentional
+dual-shell constructs. The repo's `.shellcheckrc` documents the handful of
+info-level false positives (indirectly-invoked callback helpers, the generated
+`.lane.env` source) so a plain `shellcheck` is quiet locally too; CI gates on
+`-S warning` because info/style checks vary by shellcheck version. Don't add new
+warning- or error-level findings.
+
+CI runs this on Linux and macOS — see `.github/workflows/ci.yml`. Please run the
+gate locally before opening a PR — the
 [pull request template](.github/PULL_REQUEST_TEMPLATE.md) has the full checklist.
 
 By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md). Security

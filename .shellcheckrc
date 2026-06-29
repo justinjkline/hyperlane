@@ -6,10 +6,14 @@
 # severity drops. If you write code that genuinely trips one of these for a real
 # reason, prefer a line-local `# shellcheck disable=` over loosening this file.
 
-# SC2329: "function is never invoked." hyperlane fans many small helpers through
-# callbacks (each_service, the doctor/verify/check inner fns) that shellcheck's
-# static analysis can't see being called indirectly. They ARE invoked.
+# SC2329 / SC2317: "function is never invoked" / "command appears to be
+# unreachable." hyperlane fans many small helpers through callbacks
+# (each_service, the doctor/verify/check inner fns) that shellcheck's static
+# analysis can't see being called indirectly. They ARE invoked. Different
+# shellcheck versions emit one code or the other for the same construct, so we
+# disable both to stay green across versions.
 disable=SC2329
+disable=SC2317
 
 # SC1091: "Not following: ./.lane.env was not specified as input." The lane env
 # is GENERATED per checkout at runtime; there is no static file to follow.

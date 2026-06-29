@@ -467,7 +467,11 @@ EOF
 cmd_install() {
   chmod +x "$SCRIPT_DIR/hyperlane" 2>/dev/null || true
   echo "hyperlane engine at $SCRIPT_DIR/hyperlane"
-  load_config 2>/dev/null && cmd_doctor || echo "(no config yet — copy hyperlane.conf.example → hyperlane.conf)"
+  # Show the lane table if a config exists; otherwise nudge the user to make one.
+  # (Written as if/else, not `A && B || C`, so a failure inside cmd_doctor can't
+  # silently fall through to the "no config" message.)
+  if load_config 2>/dev/null; then cmd_doctor
+  else echo "(no config yet — copy hyperlane.conf.example → hyperlane.conf)"; fi
 }
 
 usage() {
