@@ -1,0 +1,58 @@
+name: CI
+
+# Lint and smoke-test the bash engine on both Linux and macOS. hyperlane is
+# zero-dependency (bash + POSIX userland), so CI installs nothing — shellcheck is
+# preinstalled on both GitHub-hosted runners; we just call it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: shellcheck + smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Lint: shellcheck every script, then a parse check (catches syntax errors
+      # shellcheck can wave through). This is the exact local gate from
+      # CONTRIBUTING.md. shellcheck runs at full default severity; the only
+      # suppressions are three documented false positives in `.shellcheckrc`
+      # (indirect-callback helpers, the generated .lane.env source, and per-line
+      # sed indentation). A real new defect at any level turns CI red.
+      - name: shellcheck
+        run: shellcheck hyperlane lane.sh install.sh
+
+      - name: bash -n (parse check)
+        run: bash -n hyperlane lane.sh install.sh
+
+      # Smoke test: build a throwaway config + fake checkouts in a temp dir, point
+      # HYPERLANE_CONFIG at it, and assert the read-only verbs succeed. No real
+      # machine layout, no secrets, nothing to clean up beyond the temp dir.
+      - name: smoke test
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/myapp" "$tmp/myapp-multi/myapp-a"
+
+          cat > "$tmp/hyperlane.conf" <<EOF
+          HYPERLANE_ROOT="$tmp/myapp-multi"
+          HYPERLANE_PRIMARY="$tmp/myapp"
+          HYPERLANE_PREFIX="myapp"
+          HYPERLANE_SERVICES=( "api:8080" "web:3000" )
+          EOF
+
+          export HYPERLANE_CONFIG="$tmp/hyperlane.conf"
+
+          ./hyperlane doctor    # conflict table renders
+          ./hyperlane ports a   # lane a's resolved ports
+          ./hyperlane env   a   # writes myapp-a/.lane.env
+
+          rm -rf "$tmp"

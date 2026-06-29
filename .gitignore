@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PROJECT-LOCAL CONFIG MUST NEVER BE COMMITTED.
+#
+# hyperlane ships a GENERIC public engine. Everything project-specific (your
+# paths, service launch commands, secrets, the assigned-lane registry, generated
+# per-checkout env) is LOCAL to your machine and is ignored here. `hyperlane
+# guard` (and the installed pre-commit hook) fail if any of these are tracked.
+# See PROTECTION.md §2. Keep these patterns in sync with the guard in `hyperlane`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Your real config (copied from hyperlane.conf.example) — paths + secrets.
+hyperlane.conf
+
+# Any project-local override / context, including a per-project CLAUDE.local.md.
+*.local
+*.local.*
+/project.local/
+
+# Machine-local lane registry (assigned offsets for multi-char checkouts).
+.lanes
+
+# Generated per-checkout lane env (written into each checkout, but guard against
+# a stray copy landing here too).
+.lane.env
+
+# Any shared local secret/key file.
+.local-*
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.tmp
+*.tmp.*

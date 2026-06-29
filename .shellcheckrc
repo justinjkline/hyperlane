@@ -1,0 +1,21 @@
+# shellcheck configuration for hyperlane.
+#
+# We keep shellcheck at full default severity (so warnings AND info/style are
+# enforced) and disable ONLY codes that are confirmed false positives for this
+# codebase's deliberate patterns. Each disable is justified; do not add blanket
+# severity drops. If you write code that genuinely trips one of these for a real
+# reason, prefer a line-local `# shellcheck disable=` over loosening this file.
+
+# SC2329: "function is never invoked." hyperlane fans many small helpers through
+# callbacks (each_service, the doctor/verify/check inner fns) that shellcheck's
+# static analysis can't see being called indirectly. They ARE invoked.
+disable=SC2329
+
+# SC1091: "Not following: ./.lane.env was not specified as input." The lane env
+# is GENERATED per checkout at runtime; there is no static file to follow.
+disable=SC1091
+
+# SC2001: suggests ${var//search/replace} instead of sed. Our two uses indent
+# every line of a multi-line value (`sed 's/^/    /'`), which parameter
+# expansion can't do cleanly. sed is the correct, clearer tool here.
+disable=SC2001

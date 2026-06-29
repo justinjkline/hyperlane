@@ -1,0 +1,511 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────
+# hyperlane — give every parallel git checkout its own deterministic port lane.
+#
+# THE PROBLEM: you keep N parallel checkouts of the same repo side by side (to
+# run several agents/branches at once). Every checkout's dev stack defaults to
+# the SAME ports — so any two running together collide: stale leftovers steal a
+# port, one checkout's frontend talks to another's backend, daemons cross-wire.
+# Debugging that is a multi-hour nightmare because nothing errors — it just lies.
+#
+# THE FIX: assign each checkout a deterministic LANE (a port offset) derived from
+# its name, generate a per-checkout env that pins every service to its lane port,
+# and provide a "doctor" that shows who is squatting whose ports plus fail-closed
+# launchers that REFUSE to start on a foreign lane. One checkout, one lane, no
+# collisions — at any scale.
+#
+# LANE = port offset, derived from a checkout's basename relative to the config:
+#   <primary>            → lane 0   (the default ports — owned by the primary)
+#   <prefix>-a           → lane 1   (base + 1 for every service)
+#   <prefix>-b           → lane 2   …  <prefix>-z → lane 26
+#   <prefix>-<word>      → lane 27+ (worktrees / multi-char names; registered,
+#                                    persisted, collision-free without limit)
+#
+# For a service with port base B and a checkout on lane L:  PORT = B + L.
+#
+# ZERO DEPENDENCIES. Pure bash (3.2+, the macOS system bash) plus the standard
+# POSIX userland (lsof, awk, sed, find). No language runtime, no package manager.
+#
+# CONFIG-DRIVEN. Everything project-specific (where the checkouts live, how they
+# are named, which services exist, how to launch them, what extra env they need)
+# lives in a sourced shell config — NOT in this script. This script ships no
+# project strings. See `hyperlane.conf.example` for the full, documented schema.
+# Your real config is gitignored by mandate (it carries paths/secrets) — see
+# PROTECTION.md. This engine stays generic and public.
+#
+# USAGE:
+#   hyperlane                       # doctor: table of every checkout + conflicts
+#   hyperlane env     <checkout>    # write <checkout>/.lane.env (source before launch)
+#   hyperlane ports   <checkout>    # echo this checkout's service ports
+#   hyperlane launch  <checkout> <service>
+#                                   #   SANCTIONED launch: sources the lane env +
+#                                   #   REFUSES to start if the lane port is held
+#                                   #   by a DIFFERENT checkout (fail-closed)
+#   hyperlane check   <checkout> [service|all]
+#                                   #   preflight primitive (exit 0 = may take port)
+#   hyperlane reap    <checkout>    # TERM only this checkout's OUT-OF-LANE strays
+#                                   #   (safe — never another checkout, never in-lane)
+#   hyperlane verify  <checkout>    # read-only isolation assertion (exit 0 = clean)
+#   hyperlane guard                 # fail-closed: error if a project-local (gitignored)
+#                                   #   file is tracked/staged in this repo
+#   hyperlane install               # re-assert exec bits + show the lane table
+#
+# The `lane` shell function (see lane.sh) wraps this with friendlier verbs and
+# background launchers; `install.sh` wires it into your shell profile.
+# ──────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── locate ourselves (resolve symlinks so config-next-to-script works) ───────
+_self="$0"
+while [ -h "$_self" ]; do _ln="$(readlink "$_self")"; case "$_ln" in /*) _self="$_ln";; *) _self="$(dirname "$_self")/$_ln";; esac; done
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+
+# ── load the project config (the ONLY place project-specific values live) ────
+# Discovery order (first hit wins), so the tool works from anywhere:
+#   1. $HYPERLANE_CONFIG                      (explicit override)
+#   2. ./hyperlane.conf                       (cwd — handy inside a project)
+#   3. $SCRIPT_DIR/hyperlane.conf             (next to the installed engine)
+#   4. $HOME/.config/hyperlane/hyperlane.conf (XDG-ish user config)
+# The config is a *sourced shell file* (zero-dep, and hooks are just functions).
+# It MUST be gitignored — it carries machine paths and possibly secrets.
+_find_config() {
+  local c
+  for c in \
+    "${HYPERLANE_CONFIG:-}" \
+    "$PWD/hyperlane.conf" \
+    "$SCRIPT_DIR/hyperlane.conf" \
+    "$HOME/.config/hyperlane/hyperlane.conf"
+  do
+    [ -n "$c" ] && [ -f "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# A few subcommands ("guard", "help") don't need a project config; everything
+# that does lane math requires one. Loading is deferred until we know the cmd.
+CONFIG=""
+load_config() {
+  CONFIG="$(_find_config)" || {
+    cat >&2 <<EOF
+hyperlane: no config found. Copy the template and edit it (it is gitignored):
+
+    cp "$SCRIPT_DIR/hyperlane.conf.example" "$SCRIPT_DIR/hyperlane.conf"
+    \$EDITOR "$SCRIPT_DIR/hyperlane.conf"
+
+Searched: \$HYPERLANE_CONFIG, ./hyperlane.conf, $SCRIPT_DIR/hyperlane.conf,
+          ~/.config/hyperlane/hyperlane.conf
+EOF
+    exit 2
+  }
+  # shellcheck disable=SC1090
+  . "$CONFIG"
+  # ── validate the required keys so a half-written config fails loud, early ──
+  : "${HYPERLANE_ROOT:?hyperlane.conf must set HYPERLANE_ROOT (where the parallel checkouts live)}"
+  : "${HYPERLANE_PRIMARY:?hyperlane.conf must set HYPERLANE_PRIMARY (the primary checkout path)}"
+  : "${HYPERLANE_PREFIX:?hyperlane.conf must set HYPERLANE_PREFIX (clone name prefix, e.g. myapp)}"
+  # HYPERLANE_SERVICES is an array of "name:portbase" entries.
+  if [ "${#HYPERLANE_SERVICES[@]}" -eq 0 ]; then
+    echo "hyperlane.conf must set HYPERLANE_SERVICES (array of name:portbase, e.g. \"api:8080\")" >&2
+    exit 2
+  fi
+  PRIMARY_NAME="$(basename "$HYPERLANE_PRIMARY")"
+  # Persistent lane registry (machine-local, gitignored): records the assigned
+  # offset for every checkout whose name is NOT a single letter, so assignment
+  # is deterministic, remembered, and collision-free at any scale.
+  REGISTRY="${HYPERLANE_REGISTRY:-$HYPERLANE_ROOT/.lanes}"
+}
+
+# ── lane (port offset) from a checkout basename — collision-free, unlimited ──
+# Reserved band: 0 = primary, 1–26 = single letters a–z (intuitive, never in the
+# registry). Any other checkout (worktrees, multi-char suffixes) gets the next
+# free offset >= 27, persisted in $REGISTRY so it's stable forever and two
+# checkouts can never land on the same lane no matter how many you add.
+lane_of() {
+  local name="$1" sfx off
+  if [ "$name" = "$PRIMARY_NAME" ]; then echo 0; return; fi
+  case "$name" in
+    "$HYPERLANE_PREFIX"-*) sfx="${name#"$HYPERLANE_PREFIX"-}";;
+    *)                     echo -1; return;;
+  esac
+  if printf '%s' "$sfx" | grep -qE '^[a-z]$'; then
+    printf '%d\n' "$(( $(printf '%d' "'$sfx") - 96 ))"; return   # a→1 … z→26 (reserved)
+  fi
+  touch "$REGISTRY" 2>/dev/null || true
+  off="$(awk -v n="$name" '$1==n{print $2; exit}' "$REGISTRY" 2>/dev/null)"
+  if [ -z "$off" ]; then
+    off=27
+    while awk -v o="$off" '$2==o{f=1} END{exit !f}' "$REGISTRY" 2>/dev/null; do off=$((off+1)); done
+    printf '%s %s\n' "$name" "$off" >> "$REGISTRY"
+  fi
+  echo "$off"
+}
+
+# Human-facing lane LABEL = the checkout's suffix (more intuitive than the
+# numeric offset). "<prefix>-c" → "c"; primary → "primary".
+lane_label() {
+  if [ "$1" = "$PRIMARY_NAME" ]; then echo "primary"; return; fi
+  case "$1" in
+    "$HYPERLANE_PREFIX"-*) echo "${1#"$HYPERLANE_PREFIX"-}" ;;
+    *)                     echo "?" ;;
+  esac
+}
+
+# Uppercase a service name into an env-var stem (bash 3.2-safe — no ${x^^}).
+# "web-ui" → "WEB_UI"; used to build <STEM>_PORT in the lane env.
+svc_stem() { printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'; }
+
+# Iterate HYPERLANE_SERVICES, calling a callback "<name> <portbase>" for each.
+# Centralizes the "name:portbase" split so every command stays consistent.
+# NOTE: the locals are __-prefixed on purpose. bash uses DYNAMIC scope, so a
+# callback that assigns a plain name like `base`/`name` to pass a result back to
+# its caller would otherwise clobber (or be clobbered by) this function's locals.
+# Obscure names keep the callback's caller-visible variables untouched.
+each_service() {
+  local __es_cb="$1" __es_entry
+  for __es_entry in "${HYPERLANE_SERVICES[@]}"; do
+    # `|| true`: callbacks use their exit status to signal "did this entry
+    # match?" (e.g. find-a-service), NOT to report an error. Without it, a
+    # callback returning non-zero as a bare command trips `set -e` and aborts
+    # the loop mid-iteration — the bug that made `openurl`/`launch` find nothing.
+    "$__es_cb" "${__es_entry%%:*}" "${__es_entry##*:}" || true
+  done
+}
+
+# Port for a service base on a given lane.
+svc_port() { echo "$(( $1 + $2 ))"; }   # base, lane
+
+# ── process / port ownership ─────────────────────────────────────────────────
+# resolve the checkout dir a listening PID lives in (via its cwd), or its cwd
+# verbatim if it isn't one of ours (so a foreign squatter is obvious).
+owner_checkout_of_pid() {
+  local pid="$1" cwd
+  cwd="$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+  case "$cwd" in
+    "$HYPERLANE_ROOT/$HYPERLANE_PREFIX"*)
+      echo "$cwd" | sed -E "s#($HYPERLANE_ROOT/${HYPERLANE_PREFIX}[^/]*).*#\1#";;
+    "$HYPERLANE_PRIMARY"/*|"$HYPERLANE_PRIMARY")
+      echo "$HYPERLANE_PRIMARY";;
+    *) echo "$cwd";;
+  esac
+}
+
+# print "free" | "OK pid=N" | "CONFLICT pid=N owner=DIR"
+port_status() {
+  local port="$1" expected="$2" pid owner
+  pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)"
+  [ -z "$pid" ] && { echo "free"; return; }
+  owner="$(owner_checkout_of_pid "$pid")"
+  if [ "$owner" = "$expected" ]; then echo "OK pid=$pid"
+  else echo "CONFLICT pid=$pid owner=${owner:-?}"; fi
+}
+
+# Resolve a checkout argument to an absolute dir: "c" | "<prefix>-c" | abs-path |
+# "primary"/"0". Bare letters/words are taken relative to HYPERLANE_ROOT.
+resolve_checkout() {
+  case "$1" in
+    primary|0|"$PRIMARY_NAME")  echo "$HYPERLANE_PRIMARY";;
+    /*)                         echo "$1";;
+    "$HYPERLANE_PREFIX"-*)      echo "$HYPERLANE_ROOT/$1";;
+    *)                          echo "$HYPERLANE_ROOT/$HYPERLANE_PREFIX-$1";;
+  esac
+}
+
+# ── the per-lane env file ────────────────────────────────────────────────────
+# emit_env writes the env a checkout must source before launching its stack:
+#   - generic lane identity: LANE, LANE_OFFSET, LANE_CLONE
+#   - one <SERVICE>_PORT per declared service (API_PORT, WEB_PORT, …)
+#   - whatever the project's optional hyperlane_env_hook adds (secrets, DB URL,
+#     CORS, etc.) — that hook lives in the gitignored config, never here.
+emit_env() {
+  local dir="$1" name lane lbl
+  dir="$(cd "$dir" 2>/dev/null && pwd || echo "$dir")"   # absolutize so sourcing works from anywhere
+  name="$(basename "$dir")"; lane="$(lane_of "$name")"; lbl="$(lane_label "$name")"
+  [ "$lane" -lt 0 ] && { echo "not a recognized checkout: $name" >&2; return 1; }
+  echo "# lane env for $name — lane \"$lbl\" (offset $lane)"
+  echo "# generated by hyperlane from $CONFIG — source before launching this checkout's stack"
+  echo "export LANE=$lbl"
+  echo "export LANE_OFFSET=$lane"
+  echo "export LANE_CLONE=\"$dir\""
+  _emit_one() {   # name, base → export <STEM>_PORT=<base+lane>
+    local stem; stem="$(svc_stem "$1")"
+    echo "export ${stem}_PORT=$(svc_port "$2" "$lane")   # service '$1' (base $2 + lane $lane)"
+  }
+  each_service _emit_one
+  # Project-specific env (optional). Defined in the gitignored config; gets the
+  # lane vars above already in scope, so it can reference $LANE_OFFSET etc.
+  if type hyperlane_env_hook >/dev/null 2>&1; then
+    echo "# ── project env (hyperlane_env_hook) ──"
+    LANE="$lbl" LANE_OFFSET="$lane" LANE_CLONE="$dir" hyperlane_env_hook
+  fi
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+cmd_doctor() {
+  printf "%-26s %-8s" CLONE LANE
+  _hdr() { printf " %-22s" "$(svc_stem "$1")(\$)"; }
+  each_service _hdr; echo
+  printf '%.0s-' $(seq 1 98); echo
+  for d in "$HYPERLANE_PRIMARY" "$HYPERLANE_ROOT/$HYPERLANE_PREFIX"*; do
+    [ -d "$d" ] || continue
+    local n l; n="$(basename "$d")"; l="$(lane_of "$n")"; [ "$l" -lt 0 ] && continue
+    printf "%-26s %-8s" "$n" "$(lane_label "$n")"
+    _cell() { local p; p="$(svc_port "$2" "$l")"; printf " %-22s" "$p $(port_status "$p" "$d")"; }
+    each_service _cell
+    echo
+  done
+  echo
+  echo "Legend: free = nothing listening | OK = this checkout owns it | CONFLICT ="
+  echo "a different checkout (or stray) is squatting this lane's port — reap it or fix its lane."
+  echo "Run: hyperlane env <checkout>   to generate that checkout's .lane.env"
+}
+
+cmd_env() {
+  local d; d="$(resolve_checkout "$1")"
+  emit_env "$d" | tee "$d/.lane.env"
+  echo "# wrote $d/.lane.env" >&2
+}
+
+# List every recognized checkout basename (primary first), one per line.
+cmd_list() {
+  for d in "$HYPERLANE_PRIMARY" "$HYPERLANE_ROOT/$HYPERLANE_PREFIX"*; do
+    [ -d "$d" ] || continue
+    local n; n="$(basename "$d")"; [ "$(lane_of "$n")" -lt 0 ] && continue
+    echo "$n"
+  done
+}
+
+# List declared service names, one per line (the wrapper iterates these).
+cmd_services() { _s() { echo "$1"; }; each_service _s; }
+
+# Echo the absolute directory of a checkout (resolve letter/name/path). Used by
+# the wrapper for `cd`, log paths, etc. Errors if it isn't a recognized checkout.
+cmd_dir() {
+  local d n; d="$(resolve_checkout "$1")"; n="$(basename "$d")"
+  [ "$(lane_of "$n")" -lt 0 ] && { echo "not a recognized checkout: $1" >&2; exit 2; }
+  echo "$d"
+}
+
+# Echo the browser URL for a checkout's "open" service (HYPERLANE_OPEN_SERVICE,
+# default: the first declared service). Used by `lane open`.
+cmd_openurl() {
+  local d n l; d="$(resolve_checkout "$1")"; n="$(basename "$d")"; l="$(lane_of "$n")"
+  [ "$l" -lt 0 ] && { echo "not a recognized checkout: $n" >&2; exit 2; }
+  local want="${HYPERLANE_OPEN_SERVICE:-${HYPERLANE_SERVICES[0]%%:*}}" base=""
+  _f() { [ "$1" = "$want" ] && base="$2"; }
+  each_service _f
+  [ -n "$base" ] || { echo "open service '$want' not in HYPERLANE_SERVICES" >&2; exit 2; }
+  echo "http://localhost:$(svc_port "$base" "$l")"
+}
+
+# Generate the lane env AND run the project's optional one-time per-lane setup
+# (e.g. a per-lane service home). Idempotent. Defined in the gitignored config.
+cmd_setup() {
+  local d n l; d="$(resolve_checkout "$1")"; n="$(basename "$d")"; l="$(lane_of "$n")"
+  [ "$l" -lt 0 ] && { echo "not a recognized checkout: $n" >&2; exit 2; }
+  emit_env "$d" > "$d/.lane.env"; echo "env  ok  $n"
+  if type hyperlane_setup_hook >/dev/null 2>&1; then
+    LANE="$(lane_label "$n")" LANE_OFFSET="$l" LANE_CLONE="$d" hyperlane_setup_hook
+  fi
+}
+
+cmd_ports() {
+  local d n l; d="$(resolve_checkout "$1")"; n="$(basename "$d")"; l="$(lane_of "$n")"
+  [ "$l" -lt 0 ] && { echo "not a recognized checkout: $n" >&2; exit 2; }
+  local out=""
+  _p() { out="$out $(svc_port "$2" "$l")"; }
+  each_service _p
+  echo "${out# }"
+}
+
+# Fail-closed preflight: exit 0 if this checkout may take the service's lane port
+# (free, or already its own); non-zero + message if a DIFFERENT checkout squats.
+cmd_check() {
+  local d n l lbl svc="${2:-all}" rc=0
+  d="$(resolve_checkout "$1")"; n="$(basename "$d")"; l="$(lane_of "$n")"
+  [ "$l" -lt 0 ] && { echo "not a recognized checkout: $n" >&2; exit 2; }
+  lbl="$(lane_label "$n")"
+  _check_one() {  # service-name, base
+    local p st; p="$(svc_port "$2" "$l")"; st="$(port_status "$p" "$d")"
+    case "$st" in
+      free|OK*) ;;
+      *) echo "X $n $1: :$p is $st (lane $lbl) — reap the stray or fix its lane first." >&2; rc=3 ;;
+    esac
+  }
+  if [ "$svc" = all ]; then
+    each_service _check_one
+  else
+    local found=0
+    _maybe() { [ "$1" = "$svc" ] && { found=1; _check_one "$1" "$2"; }; }
+    each_service _maybe
+    [ "$found" = 0 ] && { echo "unknown service '$svc' (see HYPERLANE_SERVICES)" >&2; exit 2; }
+  fi
+  exit $rc
+}
+
+cmd_launch() {
+  local d n l lbl svc="${2:-}"
+  d="$(resolve_checkout "$1")"; n="$(basename "$d")"; l="$(lane_of "$n")"
+  [ "$l" -lt 0 ] && { echo "not a recognized checkout: $n" >&2; exit 2; }
+  lbl="$(lane_label "$n")"
+  [ -n "$svc" ] || { echo "usage: hyperlane launch <checkout> <service>" >&2; exit 2; }
+  # find the service's base + its launch function
+  local base="" stem; stem="$(svc_stem "$svc")"
+  _findbase() { [ "$1" = "$svc" ] && base="$2"; }
+  each_service _findbase
+  [ -n "$base" ] || { echo "unknown service '$svc' (see HYPERLANE_SERVICES)" >&2; exit 2; }
+  type "hyperlane_launch_$svc" >/dev/null 2>&1 || {
+    echo "hyperlane.conf defines no launch function 'hyperlane_launch_$svc' for service '$svc'" >&2; exit 2; }
+  [ -f "$d/.lane.env" ] || emit_env "$d" > "$d/.lane.env"
+  # Source the lane env (relax -u/-e: a project env hook may reference optional vars).
+  # shellcheck disable=SC1090
+  set +u; set -a; . "$d/.lane.env"; set +a; set -u
+  # Fail-closed: free or OK(this checkout) → go; CONFLICT (foreign owner) → refuse.
+  local port st; port="$(svc_port "$base" "$l")"; st="$(port_status "$port" "$d")"
+  case "$st" in
+    free|OK*) ;;
+    *) echo "X refusing to launch $svc for $n: :$port is $st" >&2
+       echo "  -> that port belongs to lane $lbl. Reap the stray (hyperlane reap <its-checkout>) or fix its lane first." >&2
+       exit 3 ;;
+  esac
+  "hyperlane_launch_$svc"
+}
+
+cmd_reap() {
+  local d n l; d="$(resolve_checkout "$1")"; n="$(basename "$d")"; l="$(lane_of "$n")"
+  [ "$l" -lt 0 ] && { echo "not a recognized checkout: $n" >&2; exit 2; }
+  # Collect this checkout's in-lane ports so we never kill them.
+  local inlane=" "
+  _coll() { inlane="$inlane$(svc_port "$2" "$l") "; }
+  each_service _coll
+  echo "Reaping OUT-OF-LANE listeners owned by $n (its in-lane ports$inlane are left alone)…"
+  local killed=0 pid port owner
+  while read -r pid port; do
+    [ -z "${pid:-}" ] && continue
+    case "$inlane" in *" $port "*) continue ;; esac      # in-lane → keep
+    owner="$(owner_checkout_of_pid "$pid")"
+    [ "$owner" = "$d" ] || continue                       # not ours → never touch
+    echo "  kill pid=$pid port=$port (owner=$n, out-of-lane)"
+    if kill -TERM "$pid" 2>/dev/null; then killed=$((killed+1)); fi
+  done < <(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1{split($9,a,":"); print $2, a[length(a)]}' | sort -u)
+  echo "reaped $killed out-of-lane listener(s) for $n"
+}
+
+cmd_verify() {
+  local d n l lbl; d="$(resolve_checkout "$1")"
+  d="$(cd "$d" 2>/dev/null && pwd || echo "$d")"
+  n="$(basename "$d")"; l="$(lane_of "$n")"
+  [ "$l" -lt 0 ] && { echo "not a recognized checkout: $n" >&2; exit 2; }
+  lbl="$(lane_label "$n")"
+  local rc=0
+  ok()   { printf '  [ok]  %s\n' "$1"; }
+  bad()  { printf '  [X]   %s\n' "$1"; rc=1; }
+  warn() { printf '  [..]  %s\n' "$1"; }
+  echo "hyperlane verify — $n (lane $lbl)"
+  # Each declared service: its lane port is free, owned by us, or a foreign squat.
+  _vfy() {
+    local p st; p="$(svc_port "$2" "$l")"; st="$(port_status "$p" "$d")"
+    case "$st" in
+      OK*)  ok "$1 :$p owned by this checkout ($st)";;
+      free) warn "$1 :$p free (service not running)";;
+      *)    bad "$1 :$p $st — a foreign checkout is squatting this lane's port";;
+    esac
+  }
+  each_service _vfy
+  # No foreign squatter on the PRIMARY's default ports (lanes leak into them most).
+  if [ "$l" -gt 0 ]; then
+    _vfy_primary() {
+      local p st; p="$2"; st="$(port_status "$p" "$HYPERLANE_PRIMARY")"
+      case "$st" in
+        free|OK*) ok "default :$p not squatted by a foreign process";;
+        *)        warn ":$p held by $st — a non-primary process on a default port can bleed cross-lane";;
+      esac
+    }
+    each_service _vfy_primary
+  fi
+  # Project-specific isolation checks (optional). e.g. "is the daemon's call-home
+  # pointed at THIS lane's backend?" Defined in the gitignored config.
+  if type hyperlane_verify_hook >/dev/null 2>&1; then
+    LANE="$lbl" LANE_OFFSET="$l" LANE_CLONE="$d" hyperlane_verify_hook || rc=1
+  fi
+  echo
+  if [ "$rc" = 0 ]; then echo "OK — lane $lbl is isolated."
+  else echo "X — lane $lbl has isolation gaps (above). Fix before trusting any cross-service test."; fi
+  exit $rc
+}
+
+# ── guard: enforce the gitignore mandate (fail-closed) ───────────────────────
+# Project-specific config (hyperlane.conf, *.local.*, project.local/, .lanes,
+# .lane.env, .local-* ) MUST be gitignored so it is never pushed to the public
+# repo. This errors if any such file is TRACKED or STAGED — run it in a
+# pre-commit hook (install.sh wires one) and from `lane doctor`.
+cmd_guard() {
+  command -v git >/dev/null 2>&1 || { echo "guard: git not found — skipped" >&2; return 0; }
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "guard: not a git repo — skipped" >&2; return 0; }
+  # Patterns that must NEVER be tracked. Keep in sync with .gitignore.
+  local patterns='hyperlane.conf$|(^|/)[^/]*\.local($|\.)|(^|/)project\.local/|(^|/)\.lanes$|(^|/)\.lane\.env$|(^|/)\.local-'
+  local tracked staged hits=0
+  tracked="$(git ls-files            | grep -nE "$patterns" || true)"
+  staged="$( git diff --cached --name-only | grep -E  "$patterns" || true)"
+  if [ -n "$tracked" ]; then
+    echo "X hyperlane guard: project-LOCAL files are TRACKED (must be gitignored):" >&2
+    echo "$tracked" | sed 's/^/    /' >&2; hits=1
+  fi
+  if [ -n "$staged" ]; then
+    echo "X hyperlane guard: project-LOCAL files are STAGED for commit:" >&2
+    echo "$staged" | sed 's/^/    /' >&2; hits=1
+  fi
+  if [ "$hits" = 0 ]; then echo "hyperlane guard: clean — no project-local files tracked or staged."; return 0; fi
+  cat >&2 <<'EOF'
+
+These files carry machine paths and possibly secrets. They must stay LOCAL.
+Fix:  git rm --cached <file>   (keeps the file on disk, stops tracking it)
+then ensure it matches a .gitignore pattern. See PROTECTION.md §2.
+EOF
+  return 1
+}
+
+cmd_install() {
+  chmod +x "$SCRIPT_DIR/hyperlane" 2>/dev/null || true
+  echo "hyperlane engine at $SCRIPT_DIR/hyperlane"
+  load_config 2>/dev/null && cmd_doctor || echo "(no config yet — copy hyperlane.conf.example → hyperlane.conf)"
+}
+
+usage() {
+  cat >&2 <<EOF
+usage: hyperlane <command> [args]
+
+  (default)                       doctor: table of every checkout + conflicts
+  env     <checkout>              write <checkout>/.lane.env
+  ports   <checkout>              echo this checkout's service ports
+  launch  <checkout> <service>    fail-closed launch in this checkout's lane
+  check   <checkout> [service]    preflight (exit 0 = may take the port)
+  reap    <checkout>              kill ONLY this checkout's out-of-lane strays
+  verify  <checkout>              read-only isolation assertion
+  guard                           error if a project-local file is tracked/staged
+  install                         re-assert exec bit + show the lane table
+
+<checkout> = a lane letter (a,b,c…), "<prefix>-c", "primary", or a path.
+Config: $SCRIPT_DIR/hyperlane.conf (gitignored). Template: hyperlane.conf.example
+EOF
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+cmd="${1:-doctor}"; [ "$#" -gt 0 ] && shift || true
+case "$cmd" in
+  guard)            cmd_guard "$@" ;;
+  help|-h|--help)   usage ;;
+  install)          cmd_install ;;
+  doctor|"")        load_config; cmd_doctor ;;
+  list)             load_config; cmd_list ;;
+  services)         load_config; cmd_services ;;
+  dir)              load_config; cmd_dir "${1:?usage: hyperlane dir <checkout>}" ;;
+  openurl)          load_config; cmd_openurl "${1:?usage: hyperlane openurl <checkout>}" ;;
+  setup)            load_config; cmd_setup "${1:?usage: hyperlane setup <checkout>}" ;;
+  env)              load_config; cmd_env "${1:?usage: hyperlane env <checkout>}" ;;
+  ports)            load_config; cmd_ports "${1:?usage: hyperlane ports <checkout>}" ;;
+  launch)           load_config; cmd_launch "${1:?usage: hyperlane launch <checkout> <service>}" "${2:-}" ;;
+  check)            load_config; cmd_check "${1:?usage: hyperlane check <checkout> [service]}" "${2:-all}" ;;
+  reap)             load_config; cmd_reap "${1:?usage: hyperlane reap <checkout>}" ;;
+  verify)           load_config; cmd_verify "${1:?usage: hyperlane verify <checkout>}" ;;
+  *)                echo "hyperlane: unknown command '$cmd'" >&2; usage; exit 2 ;;
+esac

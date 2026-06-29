@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# hyperlane.conf — YOUR project's lane configuration.
+#
+#   ⚠️  COPY THIS FILE to `hyperlane.conf` and edit it. The copy is GITIGNORED BY
+#       MANDATE — it carries machine paths and possibly secrets and must NEVER be
+#       pushed to the public repo. `hyperlane guard` fails the build if it is
+#       tracked. See PROTECTION.md §2.
+#
+#       cp hyperlane.conf.example hyperlane.conf && $EDITOR hyperlane.conf
+#
+# This file is SOURCED as bash (that is why hyperlane needs zero dependencies and
+# why the launch/env/verify "hooks" below can be plain shell functions). Set the
+# variables, declare your services, and define the hooks you need.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# WHERE THE PARALLEL CHECKOUTS LIVE — the directory that warehouses your clones.
+HYPERLANE_ROOT="$HOME/Sites/myapp-multi"
+
+# THE PRIMARY CHECKOUT — owns lane 0, i.e. the default (un-offset) ports.
+# Its basename is treated as lane "primary".
+HYPERLANE_PRIMARY="$HOME/Sites/myapp"
+
+# CLONE NAME PREFIX. Clones are named "<prefix>-<label>", e.g. myapp-a, myapp-b,
+# myapp-wip-auth. A single-letter label (a–z) gets a fixed offset (a=1 … z=26);
+# any other label is assigned the next free offset ≥27, persisted in .lanes.
+HYPERLANE_PREFIX="myapp"
+
+# SERVICES — an array of "name:portbase". For a checkout on lane L, each service
+# listens on (portbase + L). Each service's port is exported into the lane env as
+# <NAME>_PORT (uppercased, '-'→'_'): api→API_PORT, web-ui→WEB_UI_PORT.
+HYPERLANE_SERVICES=(
+  "api:8080"     # backend  → primary :8080, lane a :8081, lane b :8082 …
+  "web:3000"     # frontend → primary :3000, lane a :3001 …
+  # "worker:9000"
+)
+
+# Which service `lane open` opens in a browser (default: the first service).
+HYPERLANE_OPEN_SERVICE="web"
+
+# ── LAUNCH HOOKS ─────────────────────────────────────────────────────────────
+# One function per service: hyperlane_launch_<name>. It runs with the lane env
+# already sourced, so $LANE_CLONE and the <NAME>_PORT vars are in scope. End with
+# `exec` so the process replaces the shell (clean signals, correct pids).
+hyperlane_launch_api() {
+  cd "$LANE_CLONE/api" && exec ./run-server --port "$API_PORT"
+}
+hyperlane_launch_web() {
+  # Launch the dev server DIRECTLY on the lane port — bypass any wrapper that
+  # hardcodes the default port (a common footgun; see WISDOM).
+  cd "$LANE_CLONE/web" && exec ./node_modules/.bin/vite --port "$WEB_PORT" --host 127.0.0.1
+}
+
+# ── OPTIONAL: per-lane ENV HOOK ──────────────────────────────────────────────
+# Extra environment a checkout needs (DB URL, CORS allowlist, feature flags, …),
+# emitted into <checkout>/.lane.env. Runs with LANE / LANE_OFFSET / LANE_CLONE in
+# scope. Put project SECRETS here (this file is gitignored) — never in committed
+# files. Echo `export` lines; they are appended verbatim to the lane env.
+# hyperlane_env_hook() {
+#   cat <<EOF
+# export DATABASE_URL="postgres://localhost:5432/myapp"
+# export CORS_ALLOWED_ORIGINS="http://localhost:$((3000 + LANE_OFFSET))"
+# EOF
+# }
+
+# ── OPTIONAL: one-time per-lane SETUP HOOK ───────────────────────────────────
+# Runs on `lane setup <c>` after the env is written — for per-lane on-disk state
+# (a copied service home, a seeded config). Make it idempotent.
+# hyperlane_setup_hook() {
+#   local home="$HOME/.myapp-$LANE"
+#   [ -d "$home" ] || cp -R "$HOME/.myapp" "$home"
+# }
+
+# ── OPTIONAL: extra VERIFY HOOK ──────────────────────────────────────────────
+# Additional read-only isolation assertions for `lane verify <c>` beyond the
+# built-in port-ownership checks (e.g. "is the daemon's call-home pointed at THIS
+# lane's backend?"). Return non-zero to mark the lane as having isolation gaps.
+# hyperlane_verify_hook() {
+#   curl -sf "http://127.0.0.1:$((8080 + LANE_OFFSET))/health" >/dev/null \
+#     || { echo "  [X] api health on lane port failed"; return 1; }
+# }
