@@ -21,6 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # shellcheck is preinstalled on the ubuntu runner but NOT on macos-latest,
+      # so install it there (idempotent: skip if already present). Homebrew is
+      # available on the macOS runner; apt covers the Linux fallback.
+      - name: Ensure shellcheck is installed
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then
+              brew install shellcheck
+            else
+              sudo apt-get update && sudo apt-get install -y shellcheck
+            fi
+          fi
+          shellcheck --version
+
       # Lint: shellcheck every script, then a parse check (catches syntax errors
       # shellcheck can wave through). This is the exact local gate from
       # CONTRIBUTING.md. We gate on warning+error severity: info/style checks
