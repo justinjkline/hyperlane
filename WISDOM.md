@@ -69,6 +69,60 @@ Wrong root-cause diagnoses come from reasoning off symptoms and stale state. Pul
 
 ---
 
+## Portability
+
+### §11. Windows Has No Per-Process CWD — Ownership Falls Back to a Launch Registry
+**Trigger**: porting hyperlane to Windows (Git Bash/MSYS). The whole conflict
+model rests on `owner_checkout_of_pid` reading a listening PID's **working
+directory** (via `lsof -d cwd`) to decide which checkout owns a port. Windows
+exposes no supported way to read an arbitrary process's cwd — not via `netstat`,
+`tasklist`, or `Get-CimInstance Win32_Process` (which surfaces command line and
+exe path, but not cwd). So the cwd-based attribution simply cannot be ported.
+**Decision/Pattern**: on the netstat backend, substitute cwd-reading with a
+**launch-time PID registry** (`$HYPERLANE_ROOT/.lane-pids`, `winpid<TAB>dir`).
+`cmd_launch` can't know the eventual listener PID up front — the launch hook
+`exec`s, usually into a child-spawning runner (`npm run dev` → node, `vite`,
+`puma`) — so a **detached watcher** (`_record_owner_async`) polls the lane port
+until it binds and records *whoever actually bound it*. This is correct for exec,
+non-exec, and child-spawning hooks uniformly, because it observes the real
+listener rather than guessing. A registry **miss** returns empty owner →
+`port_status` reports CONFLICT. That degradation is **fail-closed and one-sided**:
+the only error it can make is over-reporting CONFLICT (and under-killing in
+`reap`), never a false "OK" or killing a process it can't attribute. The cost is
+that a service started *outside* hyperlane on Windows reads as a foreign squatter
+(`owner=?`) rather than being recognized — acceptable, because the safe failure
+is "investigate," not "silently cross-wire."
+**Evidence**: verified on a real Windows box — `lane launch` records the bound
+PID, `doctor` then shows `OK pid=N` for the owning checkout, and a raw
+(non-hyperlane) listener on another lane's port shows `CONFLICT pid=N owner=?`.
+**Expected effect**: never expect Windows to attribute a process hyperlane didn't
+launch. On macOS/Linux the lsof cwd path is unchanged and still attributes *any*
+listener. Codified as [PROTECTION §3.6](./PROTECTION.md).
+
+### §12. MSYS and Windows Live in Different PID Namespaces — Signal via `taskkill`
+**Trigger**: the first Windows ownership design recorded `$$` at launch. It never
+matched. Two reasons, the second fatal: (1) the launch hook `exec`s into a
+child-spawning runner, so the listener isn't `$$`; and (2) **Git Bash `$$` is an
+MSYS PID, while `netstat`/`taskkill` speak Windows PIDs** — measured on this box,
+`$$`=892 vs the Windows PID 9304 for the same shell. A recorded MSYS PID can
+*never* equal a netstat-derived Windows PID, so the registry would always miss.
+**Decision/Pattern**: on the netstat backend, **everything that identifies or
+signals a process goes through the Windows tools** and the Windows PID namespace:
+discovery via `netstat -ano`, termination via `taskkill //PID <winpid> //F`. MSYS
+`kill`/`kill -0` must not touch a netstat PID. Two Git Bash gotchas: a leading
+`/PID` gets POSIX-path-mangled into `C:/...`, so use the **double slash**
+(`//PID`, `//F`); and `//F` (force) is the pragmatic TERM-equivalent because
+console dev servers ignore a graceful close. The watcher records the Windows PID
+naturally because it reads it back from `_pids_on_port` (netstat), not from `$$`.
+**Evidence**: `_pids_on_port` returns the same PID `netstat`/Task Manager show;
+`killport` stops it where an MSYS `kill` silently no-ops.
+**Expected effect**: when adding any Windows process op, source the PID from
+`netstat` and signal with `taskkill //…`; never cross the MSYS/Windows PID
+boundary. Locale note: don't match the word "LISTENING" (Windows localizes it) —
+identify a listener by its foreign address ending in `:0`.
+
+---
+
 ## Section Number Registry
 
 | §N | Title | Section |
@@ -83,5 +137,7 @@ Wrong root-cause diagnoses come from reasoning off symptoms and stale state. Pul
 | §8 | `set -e` + Non-Zero Callback Aborts the Loop | Lane Model & Incidents |
 | §9 | Bash Dynamic Scope Shadows the Caller | Lane Model & Incidents |
 | §10 | Source Project Env First, Lane Overrides Last | Lane Model & Incidents |
+| §11 | Windows Has No CWD — Launch Registry for Ownership | Portability |
+| §12 | MSYS vs Windows PID Namespaces — Signal via `taskkill` | Portability |
 
 > Add new entries below with the next free `§N` and register them above.

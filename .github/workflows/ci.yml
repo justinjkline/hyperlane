@@ -1,13 +1,22 @@
 name: CI
 
-# Lint and smoke-test the bash engine on both Linux and macOS. hyperlane is
-# zero-dependency (bash + POSIX userland), so CI installs nothing — shellcheck is
-# preinstalled on both GitHub-hosted runners; we just call it.
+# Lint and smoke-test the bash engine on Linux, macOS, and Windows. hyperlane is
+# zero-dependency (bash + POSIX userland on macOS/Linux; bash + netstat/taskkill
+# on Windows), so CI installs nothing on the unix runners — shellcheck is
+# preinstalled there. The Windows leg runs everything under Git Bash (the same
+# environment hyperlane targets on Windows) to exercise the netstat/taskkill
+# port backend.
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# Run every step under bash on all three OSes. On windows-latest this selects
+# Git Bash, which is exactly the shell hyperlane supports on Windows.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   check:
@@ -16,15 +25,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
 
-      # shellcheck is preinstalled on the ubuntu runner but NOT on macos-latest,
-      # so install it there (idempotent: skip if already present). Homebrew is
-      # available on the macOS runner; apt covers the Linux fallback.
+      # shellcheck is OS-independent static analysis, so we run it on the two unix
+      # runners (where it's preinstalled or one package away) and skip it on
+      # Windows — the Windows leg is here to prove the netstat/taskkill runtime
+      # paths, not to re-lint. shellcheck is preinstalled on ubuntu but NOT on
+      # macos-latest, so install it there (idempotent: skip if already present).
       - name: Ensure shellcheck is installed
+        if: runner.os != 'Windows'
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
             if command -v brew >/dev/null 2>&1; then
@@ -35,8 +47,7 @@ jobs:
           fi
           shellcheck --version
 
-      # Lint: shellcheck every script, then a parse check (catches syntax errors
-      # shellcheck can wave through). This is the exact local gate from
+      # Lint: shellcheck every script. This is the exact local gate from
       # CONTRIBUTING.md. We gate on warning+error severity: info/style checks
       # (e.g. SC2317/SC2329 "looks unreachable/unused" on indirectly-invoked
       # callbacks) vary by shellcheck version and aren't worth failing a build
@@ -44,14 +55,18 @@ jobs:
       # positives so a plain local `shellcheck` is quiet too. A real warning- or
       # error-level defect turns CI red.
       - name: shellcheck
+        if: runner.os != 'Windows'
         run: shellcheck -S warning hyperlane lane.sh install.sh
 
+      # Parse check (catches syntax errors shellcheck can wave through). Runs on
+      # every OS, including the Windows Git Bash leg.
       - name: bash -n (parse check)
         run: bash -n hyperlane lane.sh install.sh
 
       # Smoke test: build a throwaway config + fake checkouts in a temp dir, point
       # HYPERLANE_CONFIG at it, and assert the read-only verbs succeed. No real
-      # machine layout, no secrets, nothing to clean up beyond the temp dir.
+      # machine layout, no secrets, nothing to clean up beyond the temp dir. On
+      # Windows this exercises the netstat backend's port scan (all ports free).
       - name: smoke test
         run: |
           set -euo pipefail
@@ -72,3 +87,21 @@ jobs:
           ./hyperlane env   a   # writes myapp-a/.lane.env
 
           rm -rf "$tmp"
+
+      # Windows-only: prove the netstat/taskkill port backend end to end. Start a
+      # listener with node (preinstalled on windows-latest), confirm `pids` finds
+      # it via `netstat -ano`, then `killport` stops it via `taskkill`, and the
+      # port goes quiet. This is the path that does NOT exist on the unix runners.
+      - name: windows netstat/taskkill smoke
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          node -e "require('http').createServer((q,r)=>r.end('ok')).listen(54321,'127.0.0.1')" &
+          for i in $(seq 1 30); do [ -n "$(./hyperlane pids 54321)" ] && break; sleep 0.3; done
+          pid="$(./hyperlane pids 54321)"
+          echo "listener pid (Windows): $pid"
+          test -n "$pid"
+          ./hyperlane killport 54321
+          for i in $(seq 1 20); do [ -z "$(./hyperlane pids 54321)" ] && break; sleep 0.3; done
+          test -z "$(./hyperlane pids 54321)"
+          echo "netstat/taskkill backend OK"

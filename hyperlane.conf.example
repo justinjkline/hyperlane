@@ -41,6 +41,12 @@ HYPERLANE_OPEN_SERVICE="web"
 # One function per service: hyperlane_launch_<name>. It runs with the lane env
 # already sourced, so $LANE_CLONE and the <NAME>_PORT vars are in scope. End with
 # `exec` so the process replaces the shell (clean signals, correct pids).
+#
+# WINDOWS NOTE: hyperlane attributes ports by watching which PID binds the lane
+# port (it can't read a process's cwd there — see WISDOM §11). It records whoever
+# binds, so child-spawning runners like `npm run dev` work fine; but `exec`-ing
+# the actual server binary keeps the process tree shallow, which makes `stop`/
+# `reap` cleaner. Prefer `exec <server> --port "$X_PORT"` over a wrapper script.
 hyperlane_launch_api() {
   cd "$LANE_CLONE/api" && exec ./run-server --port "$API_PORT"
 }

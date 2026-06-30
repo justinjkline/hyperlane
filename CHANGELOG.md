@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Windows support** (Git Bash / MSYS / Cygwin) — still zero-install. A port
+  backend is chosen once by OS (`HL_PORT_BACKEND`): `lsof` on macOS/Linux
+  (unchanged), `netstat`/`taskkill` on Windows. Since Windows exposes no
+  per-process working directory, ownership is attributed via a machine-local
+  **launch PID registry** (`.lane-pids`) populated by a detached watcher when a
+  service is started through `lane`; an unattributable listener reads as a
+  fail-closed `CONFLICT (owner=?)`. See README "Platform support" and
+  WISDOM §11–§12.
+- **`hyperlane killport <port>`** and **`hyperlane pids <port>`** — config-less
+  port utilities that centralize all OS-aware listener discovery/termination in
+  the engine; `lane stop` now uses `killport`.
+- **`.gitattributes`** pinning shell scripts to LF so Windows checkouts don't get
+  CRLF (which breaks the shebang and shellcheck).
+- CI now also runs on **windows-latest** (under Git Bash), exercising the
+  netstat/taskkill backend; `bash -n` and the smoke test run on all three OSes.
+
+### Changed
+
+- `.lane-pids` added to the gitignore mandate, the `hyperlane guard` regex, and
+  PROTECTION §2.1 (the three must stay in sync).
+
 ## [0.1.0] - 2026-06-29
 
 First public release: a zero-dependency bash CLI that gives every parallel git

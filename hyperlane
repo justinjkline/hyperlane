@@ -25,6 +25,9 @@
 #
 # ZERO DEPENDENCIES. Pure bash (3.2+, the macOS system bash) plus the standard
 # POSIX userland (lsof, awk, sed, find). No language runtime, no package manager.
+# On Windows (Git Bash / MSYS / Cygwin), where `lsof` does not exist, it falls
+# back to the always-present `netstat` + `taskkill` (see HL_PORT_BACKEND) — still
+# nothing to install. macOS/Linux behavior is unchanged.
 #
 # CONFIG-DRIVEN. Everything project-specific (where the checkouts live, how they
 # are named, which services exist, how to launch them, what extra env they need)
@@ -113,6 +116,8 @@ EOF
   # offset for every checkout whose name is NOT a single letter, so assignment
   # is deterministic, remembered, and collision-free at any scale.
   REGISTRY="${HYPERLANE_REGISTRY:-$HYPERLANE_ROOT/.lanes}"
+  # Machine-local launch PID registry (Windows ownership; gitignored by mandate).
+  PIDREG="${HYPERLANE_PIDREG:-$HYPERLANE_ROOT/.lane-pids}"
 }
 
 # ── lane (port offset) from a checkout basename — collision-free, unlimited ──
@@ -175,11 +180,131 @@ each_service() {
 svc_port() { echo "$(( $1 + $2 ))"; }   # base, lane
 
 # ── process / port ownership ─────────────────────────────────────────────────
-# resolve the checkout dir a listening PID lives in (via its cwd), or its cwd
-# verbatim if it isn't one of ours (so a foreign squatter is obvious).
+# hyperlane resolves "who is listening on this lane port, and which checkout do
+# they belong to" through the OS. There are two backends, chosen ONCE by OS:
+#   lsof    (macOS/Linux) — rich: reports a PID's cwd, so a port maps straight to
+#                           the checkout the process is running in.
+#   netstat (Windows: Git Bash/MSYS/Cygwin) — `lsof` doesn't exist there, and
+#                           Windows exposes no per-process cwd. `netstat -ano`
+#                           does list every listener with its PID, so we use that
+#                           and substitute cwd-attribution with a launch-time PID
+#                           registry (see below).
+# We pick by OS, NOT by "is lsof on PATH": a stray MSYS lsof on Windows can read
+# neither winpids nor cwd, so trusting it would mislead us. macOS/Linux therefore
+# keep the exact lsof code paths they always had; only Windows degrades — and it
+# degrades fail-closed (an unattributable listener reads as CONFLICT, never a
+# false OK). See WISDOM §11–§12.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) HL_PORT_BACKEND=netstat ;;
+  *)                    HL_PORT_BACKEND=lsof ;;
+esac
+
+# PIDs (one per line) LISTENing on a TCP port.
+_pids_on_port() {
+  local _port="$1"
+  if [ "$HL_PORT_BACKEND" = lsof ]; then
+    lsof -nP -iTCP:"$_port" -sTCP:LISTEN -t 2>/dev/null
+  else
+    # `netstat -ano -p TCP` rows are "Proto Local Foreign State PID". A LISTENing
+    # socket is the one whose FOREIGN address is *:0 — locale-proof (Windows
+    # localizes the word "LISTENING" but never the address). Split the LOCAL
+    # address on ':' and take the LAST field as the port so 0.0.0.0:, 127.0.0.1:,
+    # [::]: and [::1]: all parse; PID is column 5. sort -u collapses v4/v6 doubles.
+    netstat -ano -p TCP 2>/dev/null | awk -v p="$_port" \
+      '$1=="TCP" && $3 ~ /:0$/ { n=split($2,a,":"); if (a[n]==p) print $5 }' | sort -u
+  fi
+}
+
+# "pid port" for every TCP listener (used by reap to find out-of-lane strays).
+_all_listeners() {
+  if [ "$HL_PORT_BACKEND" = lsof ]; then
+    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1{split($9,a,":"); print $2, a[length(a)]}' | sort -u
+  else
+    netstat -ano -p TCP 2>/dev/null | awk \
+      '$1=="TCP" && $3 ~ /:0$/ { n=split($2,a,":"); print $5, a[n] }' | sort -u
+  fi
+}
+
+# Portably TERM a listening PID. lsof platforms: `kill -TERM`. Windows: the PID
+# came from netstat (a *Windows* pid) and MSYS `kill` can't signal it, so use
+# `taskkill`. `//F` (force) because console dev servers ignore a graceful close;
+# the double slash stops Git Bash from rewriting `/F` into a path.
+_term_pid() {
+  if [ "$HL_PORT_BACKEND" = lsof ]; then
+    kill -TERM "$1" 2>/dev/null
+  else
+    taskkill //PID "$1" //F >/dev/null 2>&1
+  fi
+}
+
+# ── launch PID registry (Windows cwd-substitute) ─────────────────────────────
+# Windows has no per-process cwd, so we can't ask "which checkout is PID 9304 in?"
+# Instead, at sanctioned-launch time, cmd_launch records which checkout each
+# listening PID belongs to (via a detached watcher — see _record_owner_async).
+# owner_checkout_of_pid reads it back. Format: "<winpid>\t<checkout-dir>" / line.
+# A lookup miss returns empty → CONFLICT (fail-closed). Only matters on the
+# netstat backend; lsof platforms never touch this file. $PIDREG is set in
+# load_config alongside the lane registry.
+
+# Append a "pid<TAB>dir" row (called from the detached watcher).
+_record_pid_owner() { printf '%s\t%s\n' "$1" "$2" >> "$PIDREG" 2>/dev/null || true; }
+
+# Look up the checkout dir a PID was launched in; empty if unknown.
+_pidreg_lookup() {
+  [ -f "$PIDREG" ] || return 0
+  awk -F'\t' -v pid="$1" '$1==pid{print $2; exit}' "$PIDREG" 2>/dev/null
+}
+
+# Drop registry rows whose PID is no longer a current listener (keeps it bounded
+# and prevents a recycled Windows PID from being misattributed). One netstat call.
+_prune_pidreg() {
+  [ -f "$PIDREG" ] || return 0
+  local _tmp; _tmp="$PIDREG.tmp.$$"
+  _all_listeners | awk '{print $1}' | sort -u > "$_tmp.live" 2>/dev/null || true
+  if [ -s "$_tmp.live" ]; then
+    awk 'NR==FNR{L[$1]=1; next} ($1 in L){print}' "$_tmp.live" "$PIDREG" > "$_tmp" 2>/dev/null \
+      && mv "$_tmp" "$PIDREG" 2>/dev/null
+  fi
+  rm -f "$_tmp.live" "$_tmp" 2>/dev/null || true
+}
+
+# Watcher body: poll until the lane port is bound, then record whoever bound it.
+# Run detached by _record_owner_async so it survives cmd_launch's exec. The launch
+# hook usually execs into a child-spawning runner (npm/vite/puma), so the eventual
+# listener PID is unknowable up-front — polling the port is what makes this
+# correct for exec, non-exec, and child-spawning hooks alike. It exits the instant
+# the port binds, so the timeout is just an upper bound for a service that never
+# comes up; keep it generous (~120s) because heavier stacks (Secret Manager, DB
+# init, a cold bundler) can take well over ten seconds to start listening — too
+# short and a legit service shows up as a foreign CONFLICT. Obscure local names
+# (WISDOM §9): callers never see these.
+_ro_watch() {
+  local _port="$1" _dir="$2" _i=0 _pids _bp
+  while [ "$_i" -lt 240 ]; do
+    _pids="$(_pids_on_port "$_port" || true)"
+    if [ -n "$_pids" ]; then
+      _prune_pidreg
+      for _bp in $_pids; do _record_pid_owner "$_bp" "$_dir"; done
+      return 0
+    fi
+    sleep 0.5
+    _i=$((_i+1))
+  done
+  return 0
+}
+_record_owner_async() { _ro_watch "$@" >/dev/null 2>&1 & }
+
+# resolve the checkout dir a listening PID lives in, or its cwd verbatim if it
+# isn't one of ours (so a foreign squatter is obvious). On Windows there is no
+# cwd to read, so we consult the launch registry instead; an unknown PID yields
+# empty → treated as a foreign CONFLICT downstream (fail-closed).
 owner_checkout_of_pid() {
   local pid="$1" cwd
-  cwd="$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+  if [ "$HL_PORT_BACKEND" = lsof ]; then
+    cwd="$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+  else
+    cwd="$(_pidreg_lookup "$pid")"
+  fi
   case "$cwd" in
     "$HYPERLANE_ROOT/$HYPERLANE_PREFIX"*)
       echo "$cwd" | sed -E "s#($HYPERLANE_ROOT/${HYPERLANE_PREFIX}[^/]*).*#\1#";;
@@ -192,7 +317,7 @@ owner_checkout_of_pid() {
 # print "free" | "OK pid=N" | "CONFLICT pid=N owner=DIR"
 port_status() {
   local port="$1" expected="$2" pid owner
-  pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)"
+  pid="$(_pids_on_port "$port" | head -1)"
   [ -z "$pid" ] && { echo "free"; return; }
   owner="$(owner_checkout_of_pid "$pid")"
   if [ "$owner" = "$expected" ]; then echo "OK pid=$pid"
@@ -367,6 +492,13 @@ cmd_launch() {
        echo "  -> that port belongs to lane $lbl. Reap the stray (hyperlane reap <its-checkout>) or fix its lane first." >&2
        exit 3 ;;
   esac
+  # Windows ownership: we can't read the listener's cwd after the fact, so remember
+  # which checkout this lane port's listener belongs to. The hook below `exec`s
+  # (often into a child-spawning runner), so the final PID is unknowable here — a
+  # detached watcher polls the port and records whoever actually binds it. No-op on
+  # lsof platforms, which read cwd directly. Placed AFTER the fail-closed check so a
+  # refused launch records nothing.
+  if [ "$HL_PORT_BACKEND" = netstat ]; then _record_owner_async "$port" "$d"; fi
   "hyperlane_launch_$svc"
 }
 
@@ -385,9 +517,33 @@ cmd_reap() {
     owner="$(owner_checkout_of_pid "$pid")"
     [ "$owner" = "$d" ] || continue                       # not ours → never touch
     echo "  kill pid=$pid port=$port (owner=$n, out-of-lane)"
-    if kill -TERM "$pid" 2>/dev/null; then killed=$((killed+1)); fi
-  done < <(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1{split($9,a,":"); print $2, a[length(a)]}' | sort -u)
+    if _term_pid "$pid"; then killed=$((killed+1)); fi
+  done < <(_all_listeners)
   echo "reaped $killed out-of-lane listener(s) for $n"
+}
+
+# ── config-less port utilities ───────────────────────────────────────────────
+# These need no project config — just the port backend. They centralize all
+# netstat/taskkill (vs lsof/kill) logic in the engine so the `lane` wrapper never
+# has to know the OS. `killport` is what `lane stop` calls per lane port.
+
+# Kill whatever LISTENs on a port, portably (lsof+kill or netstat+taskkill).
+cmd_killport() {
+  local port="$1" killed=0 pid
+  [ -n "$port" ] || { echo "usage: hyperlane killport <port>" >&2; exit 2; }
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if _term_pid "$pid"; then echo "stopped pid $pid on :$port"; killed=1; fi
+  done < <(_pids_on_port "$port")
+  [ "$killed" = 0 ] && echo "nothing listening on :$port"
+  return 0
+}
+
+# Echo the PID(s) LISTENing on a port — a read-only diagnostic.
+cmd_pids() {
+  local port="$1"
+  [ -n "$port" ] || { echo "usage: hyperlane pids <port>" >&2; exit 2; }
+  _pids_on_port "$port"
 }
 
 cmd_verify() {
@@ -442,7 +598,7 @@ cmd_guard() {
   command -v git >/dev/null 2>&1 || { echo "guard: git not found — skipped" >&2; return 0; }
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "guard: not a git repo — skipped" >&2; return 0; }
   # Patterns that must NEVER be tracked. Keep in sync with .gitignore.
-  local patterns='hyperlane.conf$|(^|/)[^/]*\.local($|\.)|(^|/)project\.local/|(^|/)\.lanes$|(^|/)\.lane\.env$|(^|/)\.local-'
+  local patterns='hyperlane.conf$|(^|/)[^/]*\.local($|\.)|(^|/)project\.local/|(^|/)\.lanes$|(^|/)\.lane-pids$|(^|/)\.lane\.env$|(^|/)\.local-'
   local tracked staged hits=0
   tracked="$(git ls-files            | grep -nE "$patterns" || true)"
   staged="$( git diff --cached --name-only | grep -E  "$patterns" || true)"
@@ -499,6 +655,8 @@ case "$cmd" in
   guard)            cmd_guard "$@" ;;
   help|-h|--help)   usage ;;
   install)          cmd_install ;;
+  pids)             cmd_pids "${1:?usage: hyperlane pids <port>}" ;;
+  killport)         cmd_killport "${1:?usage: hyperlane killport <port>}" ;;
   doctor|"")        load_config; cmd_doctor ;;
   list)             load_config; cmd_list ;;
   services)         load_config; cmd_services ;;

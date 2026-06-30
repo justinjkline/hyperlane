@@ -1,0 +1,11 @@
+# Shell scripts MUST be checked out with LF endings on every platform — including
+# Git Bash / MSYS on Windows, where hyperlane now runs. CRLF breaks the `#!`
+# shebang line and trips shellcheck SC1017 ("literal carriage return"). Pinning
+# eol=lf here makes the working tree consistent regardless of a user's
+# core.autocrlf setting, so the engine and the CI gate behave the same everywhere.
+hyperlane      text eol=lf
+lane.sh        text eol=lf
+install.sh     text eol=lf
+*.sh           text eol=lf
+.shellcheckrc  text eol=lf
+hyperlane.conf.example text eol=lf

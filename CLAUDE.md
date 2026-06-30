@@ -156,6 +156,7 @@ Persistent memory files carry `priority: system | frequent | contextual` (defaul
 Pure bash, no toolchain to install.
 
 - **Shell**: targets bash 3.2 (the macOS system bash) and up — avoid bash-4-only features (`${x^^}`, `declare -A`, `mapfile`). Uppercasing goes through `tr`; service lists are indexed arrays of `name:base` strings.
+- **Port backend**: `HL_PORT_BACKEND` is chosen once by `uname -s` — `lsof` on macOS/Linux, `netstat`/`taskkill` on Windows (Git Bash/MSYS/Cygwin). The lsof path must stay byte-for-byte unchanged; Windows degrades fail-closed (ownership via the `.lane-pids` launch registry — WISDOM §11–§12, PROTECTION §3.6). Never cross the MSYS/Windows PID boundary (`kill` vs `taskkill`).
 - **The pieces**: `hyperlane` (the engine CLI — all lane math, the doctor, fail-closed launch/reap/verify, the guard), `lane.sh` (the sourced `lane` shell function + completion), `install.sh` (profile wiring + pre-commit guard), `hyperlane.conf.example` (the config template).
 - **Isolate every manual run** with a throwaway config via `HYPERLANE_CONFIG=…` pointing at `mktemp -d` directories, so you never touch a real operator's checkouts or send signals to real processes. Clean it up after.
 - Lint/test: see Workflow §5 and [CONTRIBUTING.md](./CONTRIBUTING.md).
