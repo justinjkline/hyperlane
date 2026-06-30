@@ -62,6 +62,9 @@ set -euo pipefail
 _self="$0"
 while [ -h "$_self" ]; do _ln="$(readlink "$_self")"; case "$_ln" in /*) _self="$_ln";; *) _self="$(dirname "$_self")/$_ln";; esac; done
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+# Absolute path to THIS engine, for re-exec'ing ourselves as a detached helper
+# (the ownership watcher — see _record_owner_async). Symlinks already resolved above.
+SELF="$SCRIPT_DIR/$(basename "$_self")"
 
 # ── load the project config (the ONLY place project-specific values live) ────
 # Discovery order (first hit wins), so the tool works from anywhere:
@@ -269,15 +272,15 @@ _prune_pidreg() {
 }
 
 # Watcher body: poll until the lane port is bound, then record whoever bound it.
-# Run detached by _record_owner_async so it survives cmd_launch's exec. The launch
-# hook usually execs into a child-spawning runner (npm/vite/puma), so the eventual
-# listener PID is unknowable up-front — polling the port is what makes this
-# correct for exec, non-exec, and child-spawning hooks alike. It exits the instant
-# the port binds, so the timeout is just an upper bound for a service that never
-# comes up; keep it generous (~120s) because heavier stacks (Secret Manager, DB
-# init, a cold bundler) can take well over ten seconds to start listening — too
-# short and a legit service shows up as a foreign CONFLICT. Obscure local names
-# (WISDOM §9): callers never see these.
+# Re-exec'd as a detached `hyperlane _watch` by _record_owner_async (see there for
+# why detachment, not a bare `&`, is mandatory). The launch hook usually execs into
+# a child-spawning runner (npm/vite/puma), so the eventual listener PID is unknowable
+# up-front — polling the port is what makes this correct for exec, non-exec, and
+# child-spawning hooks alike. It exits the instant the port binds, so the timeout is
+# just an upper bound for a service that never comes up; keep it generous (~120s)
+# because heavier stacks (Secret Manager, DB init, a cold bundler) can take well over
+# ten seconds to start listening — too short and a legit service shows up as a foreign
+# CONFLICT. Obscure local names (WISDOM §9): callers never see these.
 _ro_watch() {
   local _port="$1" _dir="$2" _i=0 _pids _bp
   while [ "$_i" -lt 240 ]; do
@@ -292,7 +295,19 @@ _ro_watch() {
   done
   return 0
 }
-_record_owner_async() { _ro_watch "$@" >/dev/null 2>&1 & }
+# Fire the watcher as a fully DETACHED process, not a bare `&` background job.
+# Why this matters: the launch hook (lane.sh) runs the server under `nohup … &` so
+# it outlives the launching shell — which, on Windows, is often a one-shot
+# `bash -lc "…"` spawned by a cmd/PowerShell `.bat` shim that exits the instant
+# launch returns. A bare `& ` watcher shares that shell's fate and gets torn down
+# within seconds of teardown — long before a SLOW service binds (DB/Secret-Manager/
+# cold-bundler cold starts run ~40s), so its PID is never recorded and the lane
+# reads as a false `CONFLICT owner=?`. Fast binders (a warm bundler, ~5s) get caught
+# by luck — exactly the flaky asymmetry observed. The fix is to give the watcher the
+# SAME survival the server gets: re-exec ourselves under `nohup`, stdio detached, so
+# it runs its full ~120s budget independent of the launching shell. We pass the
+# resolved CONFIG through the environment so the detached copy finds the same config.
+_record_owner_async() { HYPERLANE_CONFIG="$CONFIG" nohup "$SELF" _watch "$1" "$2" >/dev/null 2>&1 & }
 
 # resolve the checkout dir a listening PID lives in, or its cwd verbatim if it
 # isn't one of ours (so a foreign squatter is obvious). On Windows there is no
@@ -669,5 +684,9 @@ case "$cmd" in
   check)            load_config; cmd_check "${1:?usage: hyperlane check <checkout> [service]}" "${2:-all}" ;;
   reap)             load_config; cmd_reap "${1:?usage: hyperlane reap <checkout>}" ;;
   verify)           load_config; cmd_verify "${1:?usage: hyperlane verify <checkout>}" ;;
+  # Internal, undocumented: the detached ownership watcher (Windows/netstat only).
+  # Spawned by _record_owner_async via `nohup "$SELF" _watch <port> <checkout-dir>`;
+  # not for direct use, so it's omitted from usage().
+  _watch)           load_config; _ro_watch "${1:?}" "${2:?}" ;;
   *)                echo "hyperlane: unknown command '$cmd'" >&2; usage; exit 2 ;;
 esac

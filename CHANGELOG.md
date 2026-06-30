@@ -30,6 +30,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.lane-pids` added to the gitignore mandate, the `hyperlane guard` regex, and
   PROTECTION §2.1 (the three must stay in sync).
 
+### Fixed
+
+- **Windows ownership watcher now survives a one-shot launching shell.** The
+  detached watcher that records a lane's listening PID was backgrounded with a
+  bare `&`, so when the launching shell was short-lived — e.g. a `bash -lc "…"`
+  spawned by a cmd/PowerShell `.bat` shim, which exits the instant `lane start`
+  returns — the watcher was torn down within seconds, before a *slow* service
+  bound its port (DB / Secret-Manager / cold-bundler cold starts run ~40s). Its
+  PID was never recorded and the lane reported a false `CONFLICT (owner=?)`; fast
+  binders (~5s) were caught only by luck. The watcher is now re-exec'd as a
+  fully detached `nohup`'d helper (internal `hyperlane _watch`), mirroring how
+  `lane.sh` detaches the server itself, so it runs its full ~120s budget
+  independent of the launching shell. macOS/Linux (`lsof`) is unaffected — it
+  reads cwd directly and never uses the watcher.
+
 ## [0.1.0] - 2026-06-29
 
 First public release: a zero-dependency bash CLI that gives every parallel git
