@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="hyperlane" width="360">
+</p>
+
 # hyperlane
 
 **Give every parallel git checkout its own lane.**
