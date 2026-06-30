@@ -19,6 +19,10 @@ hyperlane.conf
 # Machine-local lane registry (assigned offsets for multi-char checkouts).
 .lanes
 
+# Machine-local launch PID registry (Windows ownership substitute — maps each
+# launched listener PID to its checkout, since Windows exposes no per-process cwd).
+.lane-pids
+
 # Generated per-checkout lane env (written into each checkout, but guard against
 # a stray copy landing here too).
 .lane.env

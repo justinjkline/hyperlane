@@ -52,8 +52,10 @@ Project-specific configuration is **local by mandate** and must NEVER be committ
 - `hyperlane.conf` (real config — carries machine paths, clone names, and possibly secrets via its env hook)
 - `*.local` / `*.local.*` (any project-local override or context, e.g. a per-project `CLAUDE.local.md`)
 - `.lanes` (the machine-local lane registry), `.lane.env` (generated per-checkout env), `.local-*` (shared key/secret files)
+- `.lane-pids` (the machine-local launch PID registry — the Windows cwd-substitute mapping launched PIDs to checkouts; machine-specific, carries no secrets but is purely local state, see [WISDOM §11](./WISDOM.md))
 
 **Control**: these patterns are in `.gitignore`, AND `hyperlane guard` **errors (exit non-zero)** if any such file is *tracked* or *staged*. `install.sh` wires `guard` into a pre-commit hook so the mistake is caught before it leaves the machine. `guard` also runs as part of `lane doctor` workflows and the `%` close-out audit.
+**Three-way sync invariant**: the project-local set is declared in **three** places that must stay identical — the `.gitignore` patterns, the `cmd_guard` regex in `hyperlane`, and this list. Adding a new local file (as `.lane-pids` was) means updating all three in the same change; a file ignored but not guarded (or vice-versa) is a latent leak.
 **Proof path**: `git ls-files | grep -E '<the guard patterns>'` returns nothing; a deliberate `git add -f hyperlane.conf` followed by `hyperlane guard` exits 1 with a clear message.
 **Why fail-closed, not documented-only**: a comment that says "don't commit this" is advisory; under deadline pressure, advisory loses. The guard makes the dangerous thing *fail*, not *warn*.
 
@@ -85,6 +87,22 @@ The tool must run on a stock macOS box with no installs: bash 3.2 + the POSIX us
 
 ### 3.5 Callbacks Must Not Trip `errexit`
 The engine runs under `set -euo pipefail`. Helpers that iterate services via a callback (`each_service`) invoke the callback with `|| true`, because callbacks use their exit status to signal "did this entry match?" — not to report an error. A bare callback returning non-zero would abort the loop mid-iteration. Preserve this. (See [WISDOM.md](./WISDOM.md) — this bug shipped once and silently broke `launch`/`openurl`.)
+
+### 3.6 Port Backends: lsof Path Unchanged; Windows Degrades Fail-Closed
+hyperlane resolves listeners/ownership through one of two backends, chosen once by
+OS (`HL_PORT_BACKEND`): `lsof` on macOS/Linux, `netstat`+`taskkill` on Windows
+(Git Bash/MSYS/Cygwin). Two rules are load-bearing:
+- **The lsof path must stay byte-for-byte the behavior it always had.** Backend
+  selection is by `uname -s`, *not* by probing whether `lsof` is on PATH — a stray
+  MSYS `lsof` on Windows can read neither winpids nor cwd and would mislead the
+  doctor. macOS/Linux must never silently switch backends.
+- **The Windows degradation must be fail-closed and one-sided.** Without a
+  per-process cwd, ownership comes from the launch registry ([WISDOM §11](./WISDOM.md));
+  a miss must report **CONFLICT**, never a false "OK", and `reap` must **under**-kill
+  (skip anything it can't attribute), never over-kill — preserving §1.4. A change
+  that makes an unknown owner read as OK, or that signals across the MSYS/Windows
+  PID boundary with `kill` instead of `taskkill` ([WISDOM §12](./WISDOM.md)), is a
+  bug even if a quick test looks green.
 
 > Add new project invariants here as they are discovered. Each should state what
 > must hold, why it's load-bearing, and how a violation manifests.

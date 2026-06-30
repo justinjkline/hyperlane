@@ -2,8 +2,9 @@
 
 Thanks for your interest. hyperlane aims to stay small, fast, and
 **zero-dependency** — pure bash (3.2+, the macOS system bash) plus the standard
-POSIX userland (`lsof`, `awk`, `sed`, `find`). No language runtime, no package
-manager, nothing to install but the scripts themselves. Keep it that way.
+POSIX userland (`lsof`, `awk`, `sed`, `find`); on Windows (Git Bash/MSYS), the
+always-present `netstat`/`taskkill` stand in for `lsof`. No language runtime, no
+package manager, nothing to install but the scripts themselves. Keep it that way.
 
 ## Lint & check
 

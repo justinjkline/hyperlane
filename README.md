@@ -32,7 +32,7 @@ myapp-b            b        8082 free         3002 CONFLICT ⚠   9002 free
 - 🩺 **Conflict doctor** — one glance shows who owns what and who's squatting whose ports.
 - 🚦 **Fail-closed launch** — `lane start b` *refuses* to boot onto a port another checkout holds, instead of silently cross-wiring.
 - 🧹 **Surgical cleanup** — `lane reap` kills only a checkout's *out-of-lane* strays, never another session's work.
-- 🪶 **Zero dependencies** — pure bash (3.2+, stock macOS) and the POSIX userland. No runtime, no package manager, nothing to install but the scripts.
+- 🪶 **Zero dependencies** — pure bash (3.2+, stock macOS) and the POSIX userland (`lsof`/`awk`/`sed`/`find`); on Windows, the always-present `netstat`/`taskkill` instead. No runtime, no package manager, nothing to install but the scripts.
 - 🔒 **Public-safe by design** — the engine is generic; *your* paths, services, and secrets live in a gitignored config the tool refuses to let you commit.
 
 ---
@@ -186,6 +186,26 @@ artifact.
 Ownership is resolved honestly: the doctor finds *who* holds a port by walking the
 listening PID back to its working directory, so "CONFLICT" means a genuinely
 foreign checkout — not just "something's on the port."
+
+---
+
+## Platform support
+
+hyperlane runs on **macOS, Linux, and Windows** (via Git Bash / MSYS / Cygwin) —
+still zero-install. It picks a port backend by OS:
+
+- **macOS / Linux** use `lsof`, which reports a listening PID's working directory,
+  so *any* listener is attributed to the checkout it's running in.
+- **Windows** has no `lsof` and no way to read another process's working
+  directory, so hyperlane uses `netstat`/`taskkill` and attributes ports via a
+  machine-local **launch registry** (`.lane-pids`) populated when you start a
+  service through `lane`. The trade-off: on Windows, a process started *outside*
+  hyperlane shows up as a foreign `CONFLICT (owner=?)` rather than being
+  recognized. That's deliberate and **fail-closed** — the tool would rather flag
+  an unattributable port than quietly let it cross-wire. Launch your services with
+  `lane <service>` / `lane start` and they're tracked normally.
+
+The lane math, env generation, and ports are identical on every platform.
 
 ---
 

@@ -56,7 +56,7 @@ lane() {
     start)   _lane_start "${1:?usage: lane start <checkout>}" ;;   # background ALL
     stop)    _lane_stop  "${1:?usage: lane stop <checkout>}" ;;
     logs)    _lane_logs  "${1:?usage: lane logs <checkout> [service]}" "${2:-}" ;;
-    open)    local u; u="$("$bin" openurl "${1:?usage: lane open <checkout>}")" && { open "$u" 2>/dev/null || xdg-open "$u" 2>/dev/null || echo "GUI: $u"; } ;;
+    open)    local u; u="$("$bin" openurl "${1:?usage: lane open <checkout>}")" && { open "$u" 2>/dev/null || xdg-open "$u" 2>/dev/null || cygstart "$u" 2>/dev/null || cmd //c start "" "$u" 2>/dev/null || powershell -NoProfile -Command "Start-Process '$u'" 2>/dev/null || echo "GUI: $u"; } ;;
 
     *)
       # Is `sub` a declared service?  `lane <service> <checkout>` → foreground launch.
@@ -84,13 +84,13 @@ _lane_start() {
 }
 
 _lane_stop() {
-  local bin="$HYPERLANE_BIN" c="$1" killed=0 p pid
+  # Delegate to the engine's `killport`, which finds + signals listeners portably
+  # (lsof+kill on macOS/Linux, netstat+taskkill on Windows). Keeping all OS-aware
+  # port/signal logic in the engine means this wrapper never has to know the OS.
+  local bin="$HYPERLANE_BIN" c="$1" p
   for p in $("$bin" ports "$c"); do
-    for pid in $(lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null); do
-      kill "$pid" 2>/dev/null && { echo "stopped pid $pid on :$p"; killed=1; }
-    done
+    "$bin" killport "$p"
   done
-  [ "$killed" = 0 ] && echo "nothing listening on lane ports ($("$bin" ports "$c"))"
 }
 
 _lane_logs() {

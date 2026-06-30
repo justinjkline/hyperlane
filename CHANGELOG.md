@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Windows support** (Git Bash / MSYS / Cygwin) — still zero-install. A port
+  backend is chosen once by OS (`HL_PORT_BACKEND`): `lsof` on macOS/Linux
+  (unchanged), `netstat`/`taskkill` on Windows. Since Windows exposes no
+  per-process working directory, ownership is attributed via a machine-local
+  **launch PID registry** (`.lane-pids`) populated by a detached watcher when a
+  service is started through `lane`; an unattributable listener reads as a
+  fail-closed `CONFLICT (owner=?)`. See README "Platform support" and
+  WISDOM §11–§12.
+- **`hyperlane killport <port>`** and **`hyperlane pids <port>`** — config-less
+  port utilities that centralize all OS-aware listener discovery/termination in
+  the engine; `lane stop` now uses `killport`.
+- **`.gitattributes`** pinning shell scripts to LF so Windows checkouts don't get
+  CRLF (which breaks the shebang and shellcheck).
+- CI now also runs on **windows-latest** (under Git Bash), exercising the
+  netstat/taskkill backend; `bash -n` and the smoke test run on all three OSes.
+
+### Changed
+
+- `.lane-pids` added to the gitignore mandate, the `hyperlane guard` regex, and
+  PROTECTION §2.1 (the three must stay in sync).
+
+### Fixed
+
+- **Windows ownership watcher now survives a one-shot launching shell.** The
+  detached watcher that records a lane's listening PID was backgrounded with a
+  bare `&`, so when the launching shell was short-lived — e.g. a `bash -lc "…"`
+  spawned by a cmd/PowerShell `.bat` shim, which exits the instant `lane start`
+  returns — the watcher was torn down within seconds, before a *slow* service
+  bound its port (DB / Secret-Manager / cold-bundler cold starts run ~40s). Its
+  PID was never recorded and the lane reported a false `CONFLICT (owner=?)`; fast
+  binders (~5s) were caught only by luck. The watcher is now re-exec'd as a
+  fully detached `nohup`'d helper (internal `hyperlane _watch`), mirroring how
+  `lane.sh` detaches the server itself, so it runs its full ~120s budget
+  independent of the launching shell. macOS/Linux (`lsof`) is unaffected — it
+  reads cwd directly and never uses the watcher.
+
 ## [0.1.0] - 2026-06-29
 
 First public release: a zero-dependency bash CLI that gives every parallel git
