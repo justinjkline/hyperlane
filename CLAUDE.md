@@ -168,3 +168,7 @@ Pure bash, no toolchain to install.
 - Author commits as **Justin Kline**. Do **not** add a "Co-Authored-By: Claude" trailer.
 - Thoroughly comment and document *how it works and why it matters* — in the code and in the commit message.
 - Create feature branches for non-trivial changes; never force-push `main`; never skip hooks with `--no-verify` (the pre-commit hook runs `hyperlane guard` — bypassing it risks pushing project-local config). Pull requests require maintainer review before merging (see [CONTRIBUTING.md](./CONTRIBUTING.md)).
+
+## Claude.ai artifacts
+
+Do not publish or add anything to claude.ai artifacts (Artifact tool) unless the user explicitly asks for it. Default to local files or terminal output.
